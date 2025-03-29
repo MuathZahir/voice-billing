@@ -27,7 +27,7 @@ OPENAI_MODEL_STT = os.getenv('OPENAI_MODEL_STT', 'whisper-1')
 DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set.")
-
+print(DATABASE_URL)
 
 # --- Other Settings ---
 DEFAULT_CURRENCY = "JOD"
