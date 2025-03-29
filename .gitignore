@@ -64,3 +64,5 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+
+p.txt
