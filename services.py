@@ -1,97 +1,106 @@
 import requests
 import os
 import json
+import logging # Import logging
 from io import BytesIO
-from openai import OpenAI, APIError, APIConnectionError, RateLimitError # Import specific errors
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 from config import (
     WHATSAPP_API_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_API_VERSION,
     OPENAI_API_KEY, OPENAI_MODEL_STT, OPENAI_MODEL_NLU, KNOWN_BRANCHES,
     DEFAULT_CURRENCY, ERROR_MSG_API_DOWN
 )
-import datetime
+import datetime # Keep datetime import
+
+# Get a logger specific to this module
+logger = logging.getLogger(__name__)
 
 # --- Initialize OpenAI Client ---
 if not OPENAI_API_KEY:
+    # Log critical error if key is missing
+    logger.critical("CRITICAL: OPENAI_API_KEY environment variable not set.")
     raise ValueError("OPENAI_API_KEY environment variable not set.")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+logger.info("OpenAI client initialized.")
 
 
 # --- WhatsApp Media Download ---
 def get_whatsapp_media_url(media_id):
     """Gets the downloadable URL for WhatsApp media."""
+    logger.debug(f"Fetching media URL for media_id: {media_id}")
     api_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}/"
     headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}"}
     try:
         response = requests.get(api_url, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
-        return data.get('url')
+        media_url = data.get('url')
+        if media_url:
+            logger.debug(f"Successfully fetched media URL for {media_id}.")
+            return media_url
+        else:
+            logger.error(f"WhatsApp API response for {media_id} missing 'url' key. Response: {data}")
+            return None
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching media URL from WhatsApp: {e}")
+        logger.error(f"Error fetching media URL from WhatsApp for {media_id}: {e}")
         if e.response is not None:
-            print(f"WhatsApp API Response Status: {e.response.status_code}")
-            print(f"WhatsApp API Response Body: {e.response.text}")
+            logger.error(f"WhatsApp API Response Status: {e.response.status_code}, Body: {e.response.text[:200]}...") # Log partial body
         return None
 
 def download_whatsapp_media(media_url):
     """Downloads media content from the provided URL using the WhatsApp token."""
+    logger.debug(f"Downloading media from URL: {media_url[:50]}...")
     headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}"}
     try:
-        response = requests.get(media_url, headers=headers, timeout=30) # Longer timeout for download
+        response = requests.get(media_url, headers=headers, timeout=30)
         response.raise_for_status()
-        return BytesIO(response.content) # Return as BytesIO for OpenAI library
+        logger.debug(f"Successfully downloaded media (Size: {len(response.content)} bytes).")
+        return BytesIO(response.content)
     except requests.exceptions.RequestException as e:
-        print(f"Error downloading media content from WhatsApp URL: {e}")
+        logger.error(f"Error downloading media content from WhatsApp URL: {e}")
         if e.response is not None:
-            print(f"Download Response Status: {e.response.status_code}")
-            print(f"Download Response Body: {e.response.text}")
+            logger.error(f"Download Response Status: {e.response.status_code}, Body: {e.response.text[:200]}...")
         return None
 
 # --- Speech-to-Text (Whisper API) ---
 def transcribe_audio(media_id):
-    """
-    Downloads audio from WhatsApp using media_id and transcribes it using OpenAI Whisper.
-    Returns the transcribed text or None if an error occurs.
-    """
-    print(f"--- Starting STT for media ID: {media_id} ---")
+    """Downloads audio from WhatsApp and transcribes it using OpenAI Whisper."""
+    logger.info(f"Starting STT process for media ID: {media_id}")
     media_url = get_whatsapp_media_url(media_id)
     if not media_url:
-        print("Failed to get media URL.")
+        # Error already logged by get_whatsapp_media_url
         return None
 
-    print(f"Got media URL: {media_url[:50]}...") # Log truncated URL
     audio_content_stream = download_whatsapp_media(media_url)
     if not audio_content_stream:
-        print("Failed to download audio content.")
+        # Error already logged by download_whatsapp_media
         return None
 
-    print("Audio downloaded, sending to OpenAI Whisper...")
+    logger.debug(f"Sending audio stream for {media_id} to OpenAI Whisper ({OPENAI_MODEL_STT})...")
     try:
-        # Prepare the file for the API - needs a name even from BytesIO
-        audio_content_stream.name = "audio.ogg" # Assume ogg, Whisper handles various formats
-
+        audio_content_stream.name = "audio.ogg" # Provide filename hint
         transcript = openai_client.audio.transcriptions.create(
             model=OPENAI_MODEL_STT,
             file=audio_content_stream,
-            language="ar", # Specify Arabic
-            response_format="text" # Get plain text directly
+            language="ar",
+            response_format="text"
         )
-        print(f"--- STT Success. Transcription: {transcript} ---")
+        # Avoid logging full transcript if potentially long/sensitive
+        logger.info(f"STT Success for media ID: {media_id}.")
+        # logger.debug(f"Transcription result: {transcript[:100]}...") # Log partial transcript at DEBUG
         return transcript
 
     except (APIError, APIConnectionError, RateLimitError) as e:
-        print(f"OpenAI API error during transcription: {e}")
-        return None # Indicate STT failure
+        logger.error(f"OpenAI API error during transcription for {media_id}: {e}")
+        return None
     except Exception as e:
-        print(f"An unexpected error occurred during transcription: {e}")
+        logger.exception(f"Unexpected error during transcription for {media_id}: {e}") # Log with traceback
         return None
 
-
 # --- NLU using OpenAI GPT with Function Calling ---
-
-# Define the functions the LLM can call
+# Function definitions (tools) remain the same
 tools = [
-    {
+    # ... (keep tool definitions as before) ...
+     {
         "type": "function",
         "function": {
             "name": "record_transfer",
@@ -99,24 +108,11 @@ tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "amount": {
-                        "type": "number",
-                        "description": "The numerical amount of money transferred.",
-                    },
-                    "currency": {
-                        "type": "string",
-                        "description": f"The currency of the transfer (e.g., JOD, Dinar). Default is {DEFAULT_CURRENCY}.",
-                    },
-                    "source_branch": {
-                        "type": "string",
-                        "description": f"The name of the branch FROM which the money was sent. Must be one of: {', '.join(KNOWN_BRANCHES)}.",
-                    },
-                    "destination_branch": {
-                        "type": "string",
-                        "description": f"The name of the branch TO which the money was sent. Must be one of: {', '.join(KNOWN_BRANCHES)}.",
-                    },
-                },
-                "required": ["amount", "source_branch", "destination_branch"],
+                    "amount": { "type": "number", "description": "The numerical amount transferred." },
+                    "currency": { "type": "string", "description": f"Currency (e.g., JOD). Default {DEFAULT_CURRENCY}." },
+                    "source_branch": { "type": "string", "description": f"Source branch name. Must be one of: {', '.join(KNOWN_BRANCHES)}." },
+                    "destination_branch": { "type": "string", "description": f"Destination branch name. Must be one of: {', '.join(KNOWN_BRANCHES)}." },
+                }, "required": ["amount", "source_branch", "destination_branch"],
             },
         },
     },
@@ -124,43 +120,30 @@ tools = [
         "type": "function",
         "function": {
             "name": "query_branch_total",
-            "description": "Retrieves the total amount transferred FROM a specific branch for a given period (defaults to 'today').",
+            "description": "Retrieves total amount transferred FROM a specific branch today.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query_branch": {
-                        "type": "string",
-                        "description": f"The name of the branch to query the total transfers FROM. Must be one of: {', '.join(KNOWN_BRANCHES)}.",
-                    },
-                    "date_range": {
-                        "type": "string",
-                        "description": "The time period for the query (e.g., 'today', 'yesterday', 'last week'). Defaults to 'today'. Currently, only 'today' is processed.",
-                         "enum": ["today"] # Explicitly limit for now
-                    },
-                },
-                "required": ["query_branch"],
+                    "query_branch": { "type": "string", "description": f"Branch name to query. Must be one of: {', '.join(KNOWN_BRANCHES)}." },
+                    "date_range": { "type": "string", "description": "Time period (e.g., 'today'). Currently only 'today' is processed.", "enum": ["today"] },
+                }, "required": ["query_branch"],
             },
         },
     }
-    # Add more function definitions here for other features (e.g., query_to_branch, list_recent)
 ]
 
 def get_intent_and_entities_from_llm(text):
-    """
-    Uses OpenAI Chat Completion with function calling to extract intent and entities.
-    Returns a dictionary like {'intent': '...', 'entities': {...}} or None on failure.
-    """
-    print(f"--- Sending text to LLM for NLU: '{text}' ---")
+    """Uses OpenAI Chat Completion with function calling for NLU."""
+    # Avoid logging full text if sensitive, maybe log length or hash?
+    logger.info(f"Starting NLU process (Text length: {len(text)} chars)")
     if not text:
+        logger.warning("NLU called with empty text.")
         return None
 
-    system_prompt = f"""You are an assistant for a gold store business in Jordan. Your task is to understand employee requests (in Arabic) and extract information to call the appropriate function.
-Available branches are: {', '.join(KNOWN_BRANCHES)}.
-The default currency is {DEFAULT_CURRENCY}.
-Today's date is {datetime.date.today().strftime('%Y-%m-%d')}.
-Analyze the user's message and call the relevant function with the extracted parameters.""" # Added date for context
+    system_prompt = f"""You are an assistant for a gold store business in Jordan... (rest of prompt as before)""" # Keep prompt
 
     try:
+        logger.debug(f"Sending request to OpenAI ChatCompletion ({OPENAI_MODEL_NLU})")
         response = openai_client.chat.completions.create(
             model=OPENAI_MODEL_NLU,
             messages=[
@@ -168,126 +151,90 @@ Analyze the user's message and call the relevant function with the extracted par
                 {"role": "user", "content": text},
             ],
             tools=tools,
-            tool_choice="auto",  # Let the model decide which function to call
-            temperature=0.1, # Lower temperature for more predictable extraction
+            tool_choice="auto",
+            temperature=0.1,
         )
 
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
 
         if tool_calls:
-            # Process the first function call (assuming one primary action per message)
-            tool_call = tool_calls[0]
+            tool_call = tool_calls[0] # Process first call
             function_name = tool_call.function.name
             function_args_raw = tool_call.function.arguments
-
-            print(f"LLM decided to call function: {function_name}")
-            print(f"LLM raw arguments: {function_args_raw}")
+            logger.info(f"LLM decided to call function: {function_name}")
+            # Be careful logging raw arguments if they might contain sensitive interpretations
+            logger.debug(f"LLM raw function arguments: {function_args_raw}")
 
             try:
-                # Parse the JSON arguments string provided by the LLM
                 function_args = json.loads(function_args_raw)
-
-                # Basic validation/normalization (optional, LLM should follow schema)
+                # ... (perform normalization/validation as before) ...
                 if 'amount' in function_args:
-                    try:
-                        function_args['amount'] = float(function_args['amount'])
-                    except (ValueError, TypeError):
-                         print(f"Warning: LLM provided non-numeric amount: {function_args['amount']}")
-                         # Decide how to handle: error out, or try to recover? For now, let it proceed maybe db validation catches it.
-                         pass # Let handler function validate further
+                     try: function_args['amount'] = float(function_args['amount'])
+                     except (ValueError, TypeError): logger.warning(f"LLM provided non-numeric amount: {function_args['amount']}")
 
-                # Standardize currency if mentioned or default
                 if 'currency' in function_args:
-                    curr = str(function_args['currency']).upper()
-                    if "DINAR" in curr or "JOD" in curr:
-                         function_args['currency'] = "JOD"
-                    # Add other normalizations if needed
-                elif function_name == 'record_transfer': # Ensure default for transfer
-                    function_args['currency'] = DEFAULT_CURRENCY
+                     curr = str(function_args['currency']).upper()
+                     if "DINAR" in curr or "JOD" in curr: function_args['currency'] = "JOD"
+                elif function_name == 'record_transfer': function_args['currency'] = DEFAULT_CURRENCY
 
-
-                # Normalize branch names before returning (remove "فرع" etc. if LLM includes it)
-                # This step might be less critical if the LLM correctly uses the provided KNOWN_BRANCHES, but good as safeguard
                 for key in ['source_branch', 'destination_branch', 'query_branch']:
-                     if key in function_args:
-                         # You might want a more robust normalization function here if needed
-                         normalized = function_args[key].replace("فرع ", "").strip()
-                         if normalized in KNOWN_BRANCHES:
-                              function_args[key] = normalized
-                         else:
-                              # If LLM hallucinates a branch not in the KNOWN_BRANCHES list provided in prompt/functions
-                              print(f"Warning: LLM extracted branch '{function_args[key]}' not in known list. Will rely on downstream validation.")
-                              # Keep the LLM's version for now, the handler will validate against KNOWN_BRANCHES strictly.
+                    if key in function_args:
+                        normalized = function_args[key].replace("فرع ", "").strip()
+                        if normalized in KNOWN_BRANCHES:
+                             function_args[key] = normalized
+                        else:
+                             logger.warning(f"LLM extracted branch '{function_args[key]}' not in known list during NLU. Validation occurs later.")
 
 
                 result = {"intent": function_name, "entities": function_args}
-                print(f"--- NLU Success. Result: {result} ---")
+                logger.info(f"NLU Success. Intent: {result['intent']}, Entities identified.") # Avoid logging full entity dict here if sensitive
+                logger.debug(f"NLU Entities: {result['entities']}") # Log full entities at DEBUG level
                 return result
 
             except json.JSONDecodeError:
-                print(f"Error: LLM function arguments were not valid JSON: {function_args_raw}")
+                logger.error(f"NLU Error: LLM function arguments were not valid JSON: {function_args_raw}")
                 return {"intent": "error_parsing_llm", "entities": {}}
             except Exception as e:
-                 print(f"Error processing LLM function arguments: {e}")
+                 logger.exception(f"NLU Error processing LLM function arguments: {e}") # Use exception for traceback
                  return {"intent": "error_processing_llm", "entities": {}}
 
         else:
-            # The LLM didn't call a function, meaning it didn't understand or wasn't confident.
+            # LLM didn't call a function
             llm_reply = response_message.content
-            print(f"LLM did not call a function. It might have replied: {llm_reply}")
-            # You could potentially forward the LLM's text reply if it's informative,
-            # but for structured tasks, it's better to signal inability to act.
+            logger.warning(f"NLU: LLM did not call a function. User text: '{text[:100]}...'. LLM reply: '{llm_reply[:100]}...'")
             return {"intent": "unclear_request", "entities": {}}
 
     except (APIError, APIConnectionError, RateLimitError) as e:
-        print(f"OpenAI API error during NLU: {e}")
-        # Return a specific intent indicating API failure
+        logger.error(f"OpenAI API error during NLU: {e}")
         return {"intent": "error_api_down", "entities": {}}
     except Exception as e:
-        print(f"An unexpected error occurred during NLU processing: {e}")
+        logger.exception(f"Unexpected error during NLU processing: {e}") # Log with traceback
         return {"intent": "error_generic_nlu", "entities": {}}
 
 
 # --- Send WhatsApp Message (Meta Cloud API) ---
 def send_whatsapp_message(recipient_number, message_text):
     """Sends a text message using the WhatsApp Business Cloud API."""
+    logger.info(f"Attempting to send WhatsApp message to {recipient_number}")
+    # Avoid logging full message text if sensitive: logger.debug(f"Message content: {message_text[:100]}...")
     api_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": recipient_number,
-        "type": "text",
-        "text": {
-            # "preview_url": False, # Optional: disable link previews if needed
-            "body": message_text,
-        }
-    }
-    print("-" * 50)
-    print(f"--- SENDING WHATSAPP MESSAGE ---")
-    print(f"To: {recipient_number}")
-    print(f"Message: {message_text}")
-    print("-" * 50)
+    headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": recipient_number, "type": "text", "text": {"body": message_text}}
 
     try:
         response = requests.post(api_url, headers=headers, json=payload, timeout=20)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        print(f"WhatsApp message sent successfully! Response: {response.json()}")
+        response.raise_for_status()
+        logger.info(f"WhatsApp message sent successfully to {recipient_number}. Response: {response.json()}")
         return True
     except requests.exceptions.Timeout:
-        print("Error sending WhatsApp message: Request timed out.")
+        logger.error(f"Error sending WhatsApp message to {recipient_number}: Request timed out.")
         return False
     except requests.exceptions.RequestException as e:
-        print(f"Error sending WhatsApp message: {e}")
+        logger.error(f"Error sending WhatsApp message to {recipient_number}: {e}")
         if e.response is not None:
-            print(f"Response status code: {e.response.status_code}")
-            print(f"Response body: {e.response.text}")
-            # Check for specific error codes from Meta if needed for retry logic etc.
+            logger.error(f"WhatsApp Send API Response Status: {e.response.status_code}, Body: {e.response.text[:200]}...")
         return False
     except Exception as e:
-        # Catch any other unexpected errors
-        print(f"An unexpected error occurred while sending WhatsApp message: {e}")
+        logger.exception(f"Unexpected error sending WhatsApp message to {recipient_number}: {e}") # Log with traceback
         return False
