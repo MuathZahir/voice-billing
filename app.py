@@ -158,9 +158,9 @@ def handle_message():
                     text_content = message_data['text']['body']
                     logger.info(f"Received TEXT: '{text_content}'") # Be careful logging user content directly
 
-                elif message_type == 'voice':
+                elif message_type == 'audio':
                     logger.info("Received VOICE message, attempting transcription...")
-                    audio_id = message_data['voice']['id']
+                    audio_id = message_data['audio']['id']
                     text_content = transcribe_audio(audio_id) # service should log its details
                     if not text_content:
                         logger.warning(f"STT failed for message ID: {message_id}")
